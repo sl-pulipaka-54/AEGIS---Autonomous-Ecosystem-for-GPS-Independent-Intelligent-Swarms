@@ -1,0 +1,10 @@
+{
+  "name": "AEGIS Drone Delivery Platform",
+  "description": "Autonomous parcel delivery, live GPS drone tracking, automated dispatch logistics, and Oracle Command Center across the Hyderabad corridor.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
