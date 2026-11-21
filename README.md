@@ -27,9 +27,9 @@ AEGIS addresses these challenges through autonomous mission planning, sector-bas
 
 AEGIS introduces a two-layer architecture:
 
-### 🏢 Mother Base
+### 🏢 ORACLE -(Operational routing and command logistic engine)
 
-The Mother Base acts as the mission control center and is responsible for:
+The Oracle acts as the mission control center and is responsible for:
 
 - Generating mission plans
 - Creating 3D terrain maps
@@ -57,7 +57,7 @@ Each drone:
 Operator
     │
     ▼
-Mother Base
+  ORACLE
     │
     ├── Mission Planning
     ├── Sector Assignment
@@ -176,7 +176,7 @@ Drone Functions:
 
 ## 👥 Team
 
-Team Name: **AEGIS**
+Team Name: **SKY-SENTINELS**
 
 Hackathon Project focused on building a resilient and scalable autonomous drone ecosystem for next-generation mission operations.
 
