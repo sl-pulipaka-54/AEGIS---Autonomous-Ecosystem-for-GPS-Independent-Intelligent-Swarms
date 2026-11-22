@@ -69,6 +69,7 @@ export const parcels = pgTable('parcels', {
   }),
   recipientName: text('recipient_name').notNull(),
   recipientPhone: text('recipient_phone').notNull(),
+  recipientEmail: text('recipient_email').notNull().default(''),
   pickupAddress: text('pickup_address')
     .notNull()
     .default('AEGIS Mother Base Hub, Gajularamaram, Hyderabad'),

@@ -3,7 +3,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
 
 const SESSION_SECRET =
-  process.env.SESSION_SECRET || 'aegis-hyderabad-airspace-session-key-2026';
+  process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 export interface SessionUser {
   uid: string;
@@ -13,8 +13,16 @@ export interface SessionUser {
   role: 'customer' | 'operator';
 }
 
+export interface ParcelSession {
+  parcelId: number;
+  parcelNumber: string;
+  recipientName: string;
+  exp: number;
+}
+
 export interface AuthRequest extends Request {
   sessionUser?: SessionUser;
+  parcelSession?: ParcelSession;
 }
 
 export function signSessionToken(payload: SessionUser): string {
@@ -42,6 +50,46 @@ export function verifySessionToken(token: string): SessionUser | null {
   }
   try {
     return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionUser;
+  } catch {
+    return null;
+  }
+}
+
+export function signParcelToken(payload: Omit<ParcelSession, 'exp'>): string {
+  const fullPayload: ParcelSession = {
+    ...payload,
+    exp: Date.now() + 2 * 60 * 60 * 1000, // 2 hours
+  };
+  const encoded = Buffer.from(JSON.stringify(fullPayload), 'utf8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(`parcel:${encoded}`)
+    .digest('base64url');
+  return `aegis-parcel.${encoded}.${sig}`;
+}
+
+export function verifyParcelToken(token: string): ParcelSession | null {
+  if (!token.startsWith('aegis-parcel.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, encoded, sig] = parts;
+  const expected = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(`parcel:${encoded}`)
+    .digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(encoded, 'base64url').toString('utf8')
+    ) as ParcelSession;
+    if (!parsed.exp || parsed.exp < Date.now()) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -93,4 +141,26 @@ export const requireOperator = async (
     }
     next();
   });
+};
+
+export const requireParcelAccess = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  const parcelHeader =
+    (req.headers['x-parcel-token'] as string | undefined) ||
+    (req.headers.authorization?.startsWith('Bearer aegis-parcel.')
+      ? req.headers.authorization.slice('Bearer '.length).trim()
+      : undefined);
+
+  if (!parcelHeader) {
+    return res.status(401).json({ error: 'Parcel OTP verification required' });
+  }
+  const session = verifyParcelToken(parcelHeader);
+  if (!session) {
+    return res.status(401).json({ error: 'Parcel verification expired. Please re-verify OTP.' });
+  }
+  req.parcelSession = session;
+  next();
 };

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { X, Shield, Phone, Mail, Lock, CheckCircle2 } from 'lucide-react';
+import { X, Shield, Phone, Mail, Lock } from 'lucide-react';
 import { useAegis } from '../context/AegisContext';
+import { GoogleSignInButton } from './GoogleSignInButton';
 
 export const AuthGateModal: React.FC = () => {
   const {
@@ -176,17 +177,14 @@ export const AuthGateModal: React.FC = () => {
 
             {customerMethod === 'google' && (
               <div className="space-y-3 pt-2">
-                <button
-                  type="button"
-                  disabled={submitting}
+                <GoogleSignInButton
                   onClick={handleGoogle}
-                  className="w-full min-h-[48px] px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-base flex items-center justify-center gap-2.5 shadow-md transition-colors disabled:opacity-60 cursor-pointer"
-                >
-                  <CheckCircle2 className="w-5 h-5" />
-                  <span>{submitting ? 'Connecting...' : 'Continue with Google'}</span>
-                </button>
+                  disabled={submitting}
+                  label={submitting ? 'Connecting...' : 'Sign in with Google'}
+                  className="w-full"
+                />
                 <p className="text-xs text-center text-slate-500 dark:text-slate-400">
-                  Instant Firebase verification · Syncs your Hyderabad delivery profile
+                  Instant Firebase verification · Syncs your Hyderabad delivery profile &amp; Gmail
                 </p>
               </div>
             )}

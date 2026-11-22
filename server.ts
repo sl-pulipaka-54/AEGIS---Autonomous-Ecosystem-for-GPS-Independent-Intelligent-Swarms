@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import http from 'http';
 import path from 'path';
 import express from 'express';
@@ -24,6 +25,7 @@ import {
   getAllMissionsWithDetails,
   getOrCreateUserRecord,
   getParcelTrackingBundle,
+  getSingleMissionWithDetailsByParcelId,
   seedInitialFleetAndMissions,
 } from './src/db/queries.ts';
 import {
@@ -45,12 +47,111 @@ import {
   type AuthRequest,
   requireAuth,
   requireOperator,
+  requireParcelAccess,
   resolveUserFromToken,
+  signParcelToken,
   signSessionToken,
+  verifyParcelToken,
 } from './src/middleware/auth.ts';
 
 const PORT = 3000;
 const OPERATOR_PASSCODE = process.env.AEGIS_OPERATOR_PASSCODE || 'AEGIS-OPS-2026';
+
+interface ParcelOtpRecord {
+  otpHash: string;
+  parcelId: number;
+  parcelNumber: string;
+  recipientName: string;
+  recipientEmail: string;
+  expiresAt: number;
+  attempts: number;
+}
+
+const parcelOtpStore = new Map<string, ParcelOtpRecord>();
+
+function hashParcelOtp(parcelNumber: string, otp: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${parcelNumber.trim().toUpperCase()}:${otp.trim()}`)
+    .digest('hex');
+}
+
+function sanitizeEmail(email: string): string {
+  const trimmed = email.trim();
+  const atIdx = trimmed.indexOf('@');
+  if (atIdx <= 0) return trimmed;
+  const local = trimmed.slice(0, atIdx).replace(/\.+$/, '');
+  const domain = trimmed.slice(atIdx + 1);
+  return `${local}@${domain}`;
+}
+
+function maskEmailAddress(email: string): string {
+  const clean = sanitizeEmail(email);
+  const atIdx = clean.indexOf('@');
+  if (atIdx <= 0) return '••••@gmail.com';
+  const local = clean.slice(0, atIdx);
+  const domain = clean.slice(atIdx);
+  if (local.length <= 2) {
+    return `${local[0] || '•'}••••${domain}`;
+  }
+  return `${local.slice(0, 2)}••••${local.slice(-2)}${domain}`;
+}
+
+async function sendGmailOtpEmail(params: {
+  accessToken: string;
+  toEmail: string;
+  parcelNumber: string;
+  recipientName: string;
+  otp: string;
+}): Promise<{ ok: true; messageId?: string } | { ok: false; status: number; error: string }> {
+  const cleanSubjectParcel = params.parcelNumber.replace(/[\r\n]/g, '');
+  const cleanRecipient = params.recipientName.replace(/[\r\n]/g, '');
+  const cleanTo = sanitizeEmail(params.toEmail).replace(/[\r\n]/g, '');
+
+  const rawLines = [
+    `To: ${cleanTo}`,
+    `Subject: AEGIS Parcel Verification Code - ${cleanSubjectParcel}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    `Hello ${cleanRecipient},`,
+    '',
+    `Your 6-digit AEGIS verification OTP for parcel ${cleanSubjectParcel} is: ${params.otp}`,
+    '',
+    'This verification code expires in 5 minutes. Do not share it with anyone.',
+    '',
+    'AEGIS Air Delivery · Gajularamaram Hub, Hyderabad',
+  ];
+
+  const rawEncoded = Buffer.from(rawLines.join('\r\n'), 'utf8').toString('base64url');
+  const gmailRes = await fetch(
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${params.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ raw: rawEncoded }),
+    }
+  );
+
+  if (!gmailRes.ok) {
+    let errDetail = 'Failed to send verification email via Gmail.';
+    try {
+      const errJson = (await gmailRes.json()) as {
+        error?: { message?: string };
+      };
+      if (errJson.error?.message) errDetail = errJson.error.message;
+    } catch {
+      // Ignore parse failure
+    }
+    return { ok: false, status: gmailRes.status, error: errDetail };
+  }
+
+  const data = (await gmailRes.json()) as { id?: string };
+  return { ok: true, messageId: data.id };
+}
 
 let seedPromise: Promise<void> | null = null;
 async function ensureSeeded() {
@@ -69,11 +170,56 @@ async function startServer() {
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
+  const wsSubscriptions = new WeakMap<
+    WebSocket,
+    { role: 'none' | 'operator' | 'parcel'; parcelId?: number }
+  >();
+
+  wss.on('connection', (ws) => {
+    wsSubscriptions.set(ws, { role: 'none' });
+    ws.on('message', async (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString()) as {
+          type?: string;
+          token?: string;
+          parcelToken?: string;
+        };
+        if (msg.type === 'subscribe:operator' && msg.token) {
+          const user = await resolveUserFromToken(msg.token);
+          if (user?.role === 'operator') {
+            wsSubscriptions.set(ws, { role: 'operator' });
+          }
+        } else if (msg.type === 'subscribe:parcel' && msg.parcelToken) {
+          const parcelSess = verifyParcelToken(msg.parcelToken);
+          if (parcelSess) {
+            wsSubscriptions.set(ws, { role: 'parcel', parcelId: parcelSess.parcelId });
+          }
+        } else if (msg.type === 'unsubscribe') {
+          wsSubscriptions.set(ws, { role: 'none' });
+        }
+      } catch {
+        // Ignore malformed ws control frame
+      }
+    });
+  });
 
   function broadcast(payload: Record<string, unknown>) {
     const serialized = JSON.stringify(payload);
     wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
+      if (client.readyState !== WebSocket.OPEN) return;
+      const sub = wsSubscriptions.get(client);
+      if (sub?.role === 'operator') {
+        client.send(serialized);
+      }
+    });
+  }
+
+  function broadcastParcelTick(parcelId: number, mission: unknown, drone: unknown) {
+    const serialized = JSON.stringify({ type: 'parcel:tick', mission, drone });
+    wss.clients.forEach((client) => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      const sub = wsSubscriptions.get(client);
+      if (sub?.role === 'parcel' && sub.parcelId === parcelId) {
         client.send(serialized);
       }
     });
@@ -277,9 +423,301 @@ async function startServer() {
     }
   });
 
-  // --- CUSTOMER & PUBLIC TRACKING ENDPOINTS ---
+  // --- CUSTOMER PARCEL OTP VERIFICATION & SCOPED TRACKING ENDPOINTS ---
 
-  app.get('/api/parcels', async (_req, res) => {
+  app.post('/api/parcels/request-otp', async (req, res) => {
+    try {
+      const { parcelNumber } = req.body as { parcelNumber?: string };
+      const query = (parcelNumber || '').trim();
+      if (!query) {
+        return res.status(400).json({ error: 'Please enter your parcel number.' });
+      }
+
+      const normalized = query.toLowerCase();
+      const allParcels = await db.select().from(parcels);
+      const found = allParcels.find(
+        (p) =>
+          p.parcelNumber.toLowerCase() === normalized ||
+          p.parcelNumber.replace('#', '').toLowerCase() === normalized.replace('#', '')
+      );
+
+      if (!found) {
+        return res.status(404).json({ error: 'Invalid Parcel Number' });
+      }
+
+      const recipientEmail = sanitizeEmail(found.recipientEmail || '');
+      if (!recipientEmail) {
+        return res.status(400).json({
+          error: 'No Gmail address is linked with this parcel number.',
+        });
+      }
+
+      const otp = crypto.randomInt(100000, 999999).toString();
+      const key = found.parcelNumber.toUpperCase();
+      parcelOtpStore.set(key, {
+        otpHash: hashParcelOtp(found.parcelNumber, otp),
+        parcelId: found.id,
+        parcelNumber: found.parcelNumber,
+        recipientName: found.recipientName,
+        recipientEmail,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+        attempts: 0,
+      });
+
+      const maskedEmail = maskEmailAddress(recipientEmail);
+      const authHeader = req.headers.authorization;
+      const gmailToken = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+
+      if (gmailToken) {
+        const sent = await sendGmailOtpEmail({
+          accessToken: gmailToken,
+          toEmail: recipientEmail,
+          parcelNumber: found.parcelNumber,
+          recipientName: found.recipientName,
+          otp,
+        });
+
+        if (!sent.ok) {
+          parcelOtpStore.delete(key);
+          if (sent.status === 401 || sent.status === 403) {
+            return res.status(401).json({
+              error:
+                'Gmail authorization expired or missing permission. Please Sign in with Google again.',
+              needsGmailAuth: true,
+            });
+          }
+          return res.status(502).json({ error: sent.error });
+        }
+
+        await db.insert(notifications).values({
+          parcelNumber: found.parcelNumber,
+          eventType: 'Gmail OTP Verification',
+          channel: 'email',
+          title: `Verification OTP emailed via Gmail for ${found.parcelNumber}`,
+          message: `6-digit security code sent to ${maskedEmail} via Gmail.`,
+          recipientTarget: recipientEmail,
+          isRead: false,
+        });
+
+        return res.json({
+          ok: true,
+          deliveryMethod: 'gmail',
+          gmailSent: true,
+          parcelNumber: found.parcelNumber,
+          recipientName: found.recipientName,
+          maskedEmail,
+          expiresInSeconds: 300,
+        });
+      }
+
+      await db.insert(notifications).values({
+        parcelNumber: found.parcelNumber,
+        eventType: 'Gmail OTP Verification',
+        channel: 'email',
+        title: `Email verification OTP prepared for ${found.parcelNumber}`,
+        message: `6-digit security code prepared for registered Gmail ${maskedEmail}.`,
+        recipientTarget: recipientEmail,
+        isRead: false,
+      });
+
+      res.json({
+        ok: true,
+        deliveryMethod: 'preview_email',
+        gmailSent: false,
+        parcelNumber: found.parcelNumber,
+        recipientName: found.recipientName,
+        maskedEmail,
+        expiresInSeconds: 300,
+        previewOtp: otp,
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unable to send Gmail OTP';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/parcels/gmail-otp-check', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const gmailToken = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      if (!gmailToken) {
+        return res.status(401).json({ error: 'Gmail authorization required' });
+      }
+      const parcelNumber = String(req.query.parcelNumber || '').trim();
+      if (!parcelNumber) {
+        return res.status(400).json({ error: 'parcelNumber is required' });
+      }
+
+      const q = encodeURIComponent(`"AEGIS" "${parcelNumber}"`);
+      const listRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=3`,
+        {
+          headers: { Authorization: `Bearer ${gmailToken}` },
+        }
+      );
+      if (!listRes.ok) {
+        return res.status(listRes.status).json({
+          error: 'Unable to read Gmail messages. Please reconnect Google Sign-In.',
+        });
+      }
+
+      const listData = (await listRes.json()) as {
+        messages?: Array<{ id: string }>;
+      };
+      for (const item of listData.messages || []) {
+        const msgRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${item.id}?format=full`,
+          {
+            headers: { Authorization: `Bearer ${gmailToken}` },
+          }
+        );
+        if (!msgRes.ok) continue;
+        const msgJson = (await msgRes.json()) as {
+          snippet?: string;
+          payload?: {
+            body?: { data?: string };
+            parts?: Array<{ body?: { data?: string } }>;
+          };
+        };
+        const rawParts = [
+          msgJson.snippet || '',
+          msgJson.payload?.body?.data
+            ? Buffer.from(msgJson.payload.body.data, 'base64url').toString('utf8')
+            : '',
+          ...(msgJson.payload?.parts || []).map((p) =>
+            p.body?.data ? Buffer.from(p.body.data, 'base64url').toString('utf8') : ''
+          ),
+        ].join('\n');
+
+        const match = rawParts.match(/is:\s*(\d{6})/i) || rawParts.match(/\b(\d{6})\b/);
+        if (match?.[1]) {
+          return res.json({ found: true, otp: match[1] });
+        }
+      }
+
+      return res.json({ found: false });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unable to check Gmail inbox';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post('/api/parcels/verify-otp', async (req, res) => {
+    try {
+      const { parcelNumber, otp } = req.body as {
+        parcelNumber?: string;
+        otp?: string;
+      };
+      const query = (parcelNumber || '').trim();
+      const cleanOtp = (otp || '').trim();
+      if (!query || !cleanOtp) {
+        return res
+          .status(400)
+          .json({ error: 'Parcel number and 6-digit OTP are required.' });
+      }
+
+      const normalized = query.toLowerCase();
+      const allParcels = await db.select().from(parcels);
+      const found = allParcels.find(
+        (p) =>
+          p.parcelNumber.toLowerCase() === normalized ||
+          p.parcelNumber.replace('#', '').toLowerCase() === normalized.replace('#', '')
+      );
+
+      if (!found) {
+        return res.status(404).json({ error: 'Invalid Parcel Number' });
+      }
+
+      const key = found.parcelNumber.toUpperCase();
+      const record = parcelOtpStore.get(key);
+      if (!record || record.expiresAt < Date.now()) {
+        parcelOtpStore.delete(key);
+        return res.status(400).json({
+          error: 'OTP has expired or was not requested. Please request a new OTP.',
+        });
+      }
+
+      if (record.attempts >= 5) {
+        parcelOtpStore.delete(key);
+        return res.status(429).json({
+          error: 'Too many incorrect OTP attempts. Please request a new OTP.',
+        });
+      }
+
+      const candidateBuf = Buffer.from(hashParcelOtp(found.parcelNumber, cleanOtp), 'hex');
+      const expectedBuf = Buffer.from(record.otpHash, 'hex');
+      const matches =
+        candidateBuf.length === expectedBuf.length &&
+        crypto.timingSafeEqual(candidateBuf, expectedBuf);
+
+      if (!matches) {
+        record.attempts += 1;
+        return res.status(401).json({
+          error: `Incorrect OTP (${5 - record.attempts} attempts remaining).`,
+        });
+      }
+
+      parcelOtpStore.delete(key);
+
+      const parcelToken = signParcelToken({
+        parcelId: found.id,
+        parcelNumber: found.parcelNumber,
+        recipientName: found.recipientName,
+      });
+
+      const mission = await getSingleMissionWithDetailsByParcelId(found.id);
+      const parcelNotifs = await db
+        .select()
+        .from(notifications)
+        .where(eq(notifications.parcelNumber, found.parcelNumber))
+        .orderBy(desc(notifications.createdAt))
+        .limit(20);
+
+      res.json({
+        verified: true,
+        parcelToken,
+        mission,
+        drone: mission?.drone || null,
+        notifications: parcelNotifs,
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'OTP verification failed';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/customer/parcel', requireParcelAccess, async (req: AuthRequest, res) => {
+    try {
+      const sess = req.parcelSession!;
+      const mission = await getSingleMissionWithDetailsByParcelId(sess.parcelId);
+      if (!mission) {
+        return res.status(404).json({ error: 'Parcel mission not found.' });
+      }
+      const parcelNotifs = await db
+        .select()
+        .from(notifications)
+        .where(eq(notifications.parcelNumber, sess.parcelNumber))
+        .orderBy(desc(notifications.createdAt))
+        .limit(20);
+
+      res.json({
+        mission,
+        drone: mission.drone || null,
+        notifications: parcelNotifs,
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to load parcel';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // --- OPERATOR & PARCEL-SCOPED TRACKING ENDPOINTS ---
+
+  app.get('/api/parcels', requireOperator, async (_req, res) => {
     try {
       const details = await getAllMissionsWithDetails();
       res.json(details);
@@ -291,9 +729,28 @@ async function startServer() {
 
   app.get('/api/parcels/track/:parcelNumber', async (req, res) => {
     try {
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      const parcelHdr = (req.headers['x-parcel-token'] as string | undefined) || '';
+
+      const opUser = token ? await resolveUserFromToken(token) : null;
+      const parcelSess = verifyParcelToken(parcelHdr || token);
+      const requestedNum = req.params.parcelNumber.trim().toLowerCase().replace('#', '');
+
+      const allowed =
+        opUser?.role === 'operator' ||
+        (parcelSess &&
+          parcelSess.parcelNumber.toLowerCase().replace('#', '') === requestedNum);
+
+      if (!allowed) {
+        return res.status(401).json({ error: 'Parcel OTP verification required' });
+      }
+
       const bundle = await getParcelTrackingBundle(req.params.parcelNumber);
       if (!bundle) {
-        return res.status(404).json({ error: 'Parcel number not found in AEGIS airspace.' });
+        return res.status(404).json({ error: 'Invalid Parcel Number' });
       }
       res.json(bundle);
     } catch (error: unknown) {
@@ -308,9 +765,29 @@ async function startServer() {
         parcelNumber: string;
         qrCode: string;
       };
+
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      const parcelHdr = (req.headers['x-parcel-token'] as string | undefined) || '';
+
+      const opUser = token ? await resolveUserFromToken(token) : null;
+      const parcelSess = verifyParcelToken(parcelHdr || token);
+      const requestedNum = (parcelNumber || '').trim().toLowerCase().replace('#', '');
+
+      const allowed =
+        opUser?.role === 'operator' ||
+        (parcelSess &&
+          parcelSess.parcelNumber.toLowerCase().replace('#', '') === requestedNum);
+
+      if (!allowed) {
+        return res.status(401).json({ error: 'Parcel OTP verification required' });
+      }
+
       const bundle = await getParcelTrackingBundle(parcelNumber);
       if (!bundle) {
-        return res.status(404).json({ error: 'Parcel not found' });
+        return res.status(404).json({ error: 'Invalid Parcel Number' });
       }
       const verified =
         bundle.parcel.qrCode.toLowerCase() === (qrCode || '').trim().toLowerCase();
@@ -328,33 +805,75 @@ async function startServer() {
 
   // --- NOTIFICATIONS ---
 
-  app.get('/api/notifications', async (_req, res) => {
+  app.get('/api/notifications', async (req, res) => {
     try {
-      const list = await db
-        .select()
-        .from(notifications)
-        .orderBy(desc(notifications.createdAt))
-        .limit(40);
-      res.json(list);
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      const parcelHdr = (req.headers['x-parcel-token'] as string | undefined) || '';
+
+      const opUser = token ? await resolveUserFromToken(token) : null;
+      if (opUser?.role === 'operator') {
+        const list = await db
+          .select()
+          .from(notifications)
+          .orderBy(desc(notifications.createdAt))
+          .limit(40);
+        return res.json(list);
+      }
+
+      const parcelSess = verifyParcelToken(parcelHdr || token);
+      if (parcelSess) {
+        const list = await db
+          .select()
+          .from(notifications)
+          .where(eq(notifications.parcelNumber, parcelSess.parcelNumber))
+          .orderBy(desc(notifications.createdAt))
+          .limit(20);
+        return res.json(list);
+      }
+
+      return res.status(401).json({ error: 'Authentication or parcel verification required' });
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Failed to load notifications';
       res.status(500).json({ error: msg });
     }
   });
 
-  app.patch('/api/notifications/read-all', async (_req, res) => {
+  app.patch('/api/notifications/read-all', async (req, res) => {
     try {
-      await db.update(notifications).set({ isRead: true });
-      res.json({ ok: true });
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      const parcelHdr = (req.headers['x-parcel-token'] as string | undefined) || '';
+
+      const opUser = token ? await resolveUserFromToken(token) : null;
+      if (opUser?.role === 'operator') {
+        await db.update(notifications).set({ isRead: true });
+        return res.json({ ok: true });
+      }
+
+      const parcelSess = verifyParcelToken(parcelHdr || token);
+      if (parcelSess) {
+        await db
+          .update(notifications)
+          .set({ isRead: true })
+          .where(eq(notifications.parcelNumber, parcelSess.parcelNumber));
+        return res.json({ ok: true });
+      }
+
+      return res.status(401).json({ error: 'Unauthorized' });
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Failed to mark read';
       res.status(500).json({ error: msg });
     }
   });
 
-  // --- FLEET, WEATHER, BATTERY & ORACLE TELEMETRY ---
+  // --- FLEET, WEATHER, BATTERY & ORACLE TELEMETRY (OPERATOR) ---
 
-  app.get('/api/fleet', async (_req, res) => {
+  app.get('/api/fleet', requireOperator, async (_req, res) => {
     try {
       const fleet = await db.select().from(drones).orderBy(drones.id);
       const batteries = await db
@@ -501,6 +1020,7 @@ async function startServer() {
     parcelNumber: string;
     recipientName: string;
     recipientPhone?: string;
+    recipientEmail?: string;
     address: string;
     deliveryDate?: string;
     deliveryTime?: string;
@@ -518,6 +1038,7 @@ async function startServer() {
       parcelNumber,
       recipientName,
       recipientPhone,
+      recipientEmail,
       address,
       deliveryDate,
       deliveryTime,
@@ -622,6 +1143,7 @@ async function startServer() {
         parcelNumber: cleanParcelNum,
         recipientName: recipientName.trim(),
         recipientPhone: recipientPhone?.trim() || '+91 98490 00000',
+        recipientEmail: sanitizeEmail(recipientEmail || '') || 'customer@aegis.in',
         pickupAddress: MOTHER_BASE.address,
         pickupLat: MOTHER_BASE.lat,
         pickupLng: MOTHER_BASE.lng,
@@ -704,7 +1226,7 @@ async function startServer() {
             ch === 'sms'
               ? newParcel.recipientPhone
               : ch === 'email'
-                ? 'recipient-alert@aegis.in'
+                ? newParcel.recipientEmail || 'recipient-alert@aegis.in'
                 : 'Web Push Channel',
           isRead: false,
         }))
@@ -1432,6 +1954,9 @@ async function startServer() {
           drones: updatedFleet,
           missions: updatedMissions,
         });
+        for (const m of updatedMissions) {
+          broadcastParcelTick(m.parcelId, m, m.drone || null);
+        }
       }
     } catch (err) {
       console.error('Telemetry tick error:', err);

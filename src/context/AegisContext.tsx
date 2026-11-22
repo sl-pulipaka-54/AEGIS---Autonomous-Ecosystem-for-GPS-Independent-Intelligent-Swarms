@@ -6,8 +6,19 @@ import React, {
   useRef,
   useState,
 } from 'react';
-import { signInWithPopup, signOut as firebaseSignOut } from 'firebase/auth';
-import { auth, googleAuthProvider } from '../lib/firebase';
+import {
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+} from 'firebase/auth';
+import {
+  auth,
+  clearGmailAccessToken,
+  connectGmailWithGoogle,
+  googleAuthProvider,
+  initGmailAuth,
+  setGmailAccessToken as cacheGmailAccessToken,
+} from '../lib/firebase';
 import type {
   BatteryReport,
   CustomerProfile,
@@ -19,6 +30,16 @@ import type {
   UserRole,
   WeatherReport,
 } from '../types/aegis';
+
+export interface ParcelOtpChallenge {
+  parcelNumber: string;
+  recipientName: string;
+  maskedEmail: string;
+  deliveryMethod: 'gmail' | 'preview_email';
+  gmailSent: boolean;
+  expiresInSeconds: number;
+  previewOtp?: string;
+}
 
 interface AegisContextValue {
   theme: 'light' | 'dark';
@@ -32,6 +53,15 @@ interface AegisContextValue {
   user: UserRecord | null;
   profile: CustomerProfile | null;
   token: string | null;
+  gmailAccessToken: string | null;
+  gmailEmail: string | null;
+  connectGmail: () => Promise<void>;
+  disconnectGmail: () => void;
+  parcelToken: string | null;
+  requestParcelOtp: (parcelNumber: string) => Promise<ParcelOtpChallenge>;
+  verifyParcelOtp: (parcelNumber: string, otp: string) => Promise<void>;
+  checkGmailInboxOtp: (parcelNumber: string) => Promise<string | null>;
+  clearVerifiedParcel: () => void;
   mapsApiKey: string;
   missions: MissionWithDetails[];
   drones: DroneRecord[];
@@ -73,6 +103,9 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
   const [user, setUser] = useState<UserRecord | null>(null);
   const [profile, setProfile] = useState<CustomerProfile | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [gmailAccessToken, setGmailAccessToken] = useState<string | null>(null);
+  const [gmailEmail, setGmailEmail] = useState<string | null>(null);
+  const [parcelToken, setParcelToken] = useState<string | null>(null);
 
   const [mapsApiKey, setMapsApiKey] = useState<string>(
     import.meta.env.VITE_GOOGLE_MAPS_API_KEY || ''
@@ -90,6 +123,7 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
   const [authModalRole, setAuthModalRole] = useState<UserRole>('customer');
 
   const lastNotifCountRef = useRef(0);
+  const wsRef = useRef<WebSocket | null>(null);
 
   // Sync Tailwind v4 `.dark` class on <html>
   useEffect(() => {
@@ -101,6 +135,21 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   }, [theme]);
 
+  // Keep Gmail in-memory token synchronized with Firebase auth state
+  useEffect(() => {
+    const unsubscribe = initGmailAuth(
+      (fbUser, accessToken) => {
+        setGmailAccessToken(accessToken);
+        setGmailEmail(fbUser.email || null);
+      },
+      () => {
+        setGmailAccessToken(null);
+        setGmailEmail(null);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
   }, []);
@@ -108,38 +157,64 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
   const refreshAllData = useCallback(async () => {
     try {
       setDataError(null);
-      const [configRes, parcelsRes, fleetRes, notifRes] = await Promise.all([
-        fetch('/api/config/public'),
-        fetch('/api/parcels'),
-        fetch('/api/fleet'),
-        fetch('/api/notifications'),
-      ]);
-
+      const configRes = await fetch('/api/config/public');
       if (configRes.ok) {
         const cfg = (await configRes.json()) as { mapsApiKey?: string };
         if (cfg.mapsApiKey) setMapsApiKey(cfg.mapsApiKey);
       }
 
-      if (parcelsRes.ok) {
-        const data = (await parcelsRes.json()) as MissionWithDetails[];
-        setMissions(data);
-      }
+      if (user?.role === 'operator' && token) {
+        const headers = { Authorization: `Bearer ${token}` };
+        const [parcelsRes, fleetRes, notifRes] = await Promise.all([
+          fetch('/api/parcels', { headers }),
+          fetch('/api/fleet', { headers }),
+          fetch('/api/notifications', { headers }),
+        ]);
 
-      if (fleetRes.ok) {
-        const fleetData = (await fleetRes.json()) as {
-          drones: DroneRecord[];
-          batteryReports: BatteryReport[];
-          weather: WeatherReport | null;
-        };
-        setDrones(fleetData.drones);
-        setBatteryReports(fleetData.batteryReports);
-        setWeather(fleetData.weather);
-      }
-
-      if (notifRes.ok) {
-        const notifs = (await notifRes.json()) as NotificationRecord[];
-        setNotifications(notifs);
-        lastNotifCountRef.current = notifs.length;
+        if (parcelsRes.ok) {
+          const data = (await parcelsRes.json()) as MissionWithDetails[];
+          setMissions(data);
+        }
+        if (fleetRes.ok) {
+          const fleetData = (await fleetRes.json()) as {
+            drones: DroneRecord[];
+            batteryReports: BatteryReport[];
+            weather: WeatherReport | null;
+          };
+          setDrones(fleetData.drones);
+          setBatteryReports(fleetData.batteryReports);
+          setWeather(fleetData.weather);
+        }
+        if (notifRes.ok) {
+          const notifs = (await notifRes.json()) as NotificationRecord[];
+          setNotifications(notifs);
+          lastNotifCountRef.current = notifs.length;
+        }
+      } else if (parcelToken) {
+        const res = await fetch('/api/customer/parcel', {
+          headers: { 'X-Parcel-Token': parcelToken },
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            mission: MissionWithDetails | null;
+            drone: DroneRecord | null;
+            notifications: NotificationRecord[];
+          };
+          setMissions(data.mission ? [data.mission] : []);
+          setDrones(data.drone ? [data.drone] : []);
+          setNotifications(data.notifications || []);
+          lastNotifCountRef.current = (data.notifications || []).length;
+        } else if (res.status === 401) {
+          setParcelToken(null);
+          setMissions([]);
+          setDrones([]);
+          setNotifications([]);
+        }
+      } else {
+        setMissions([]);
+        setDrones([]);
+        setBatteryReports([]);
+        setNotifications([]);
       }
     } catch (err) {
       console.error('Data sync failed:', err);
@@ -147,32 +222,51 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
     } finally {
       setLoadingData(false);
     }
-  }, []);
+  }, [user?.role, token, parcelToken]);
 
   useEffect(() => {
     void refreshAllData();
   }, [refreshAllData]);
 
-  // Real-time WebSocket Telemetry Listener
+  // Real-time WebSocket Telemetry Listener (strictly scoped by role/parcel token)
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const sendSubscription = (ws: WebSocket) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      if (user?.role === 'operator' && token) {
+        ws.send(JSON.stringify({ type: 'subscribe:operator', token }));
+      } else if (parcelToken) {
+        ws.send(JSON.stringify({ type: 'subscribe:parcel', parcelToken }));
+      } else {
+        ws.send(JSON.stringify({ type: 'unsubscribe' }));
+      }
+    };
+
     const connect = () => {
       socket = new WebSocket(wsUrl);
+      wsRef.current = socket;
+      socket.onopen = () => {
+        if (socket) sendSubscription(socket);
+      };
       socket.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data as string) as {
             type: string;
             drones?: DroneRecord[];
             missions?: MissionWithDetails[];
-            notifications?: NotificationRecord[];
+            mission?: MissionWithDetails | null;
+            drone?: DroneRecord | null;
           };
           if (msg.type === 'telemetry:tick') {
             if (msg.drones) setDrones(msg.drones);
             if (msg.missions) setMissions(msg.missions);
+          } else if (msg.type === 'parcel:tick') {
+            if (msg.mission) setMissions([msg.mission]);
+            if (msg.drone) setDrones([msg.drone]);
           } else if (
             msg.type === 'mission:created' ||
             msg.type === 'mission:updated' ||
@@ -185,6 +279,7 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
         }
       };
       socket.onclose = () => {
+        wsRef.current = null;
         reconnectTimer = setTimeout(connect, 4000);
       };
     };
@@ -194,7 +289,7 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [refreshAllData]);
+  }, [refreshAllData, user?.role, token, parcelToken]);
 
   // Trigger browser Push Notification when unread notifications increase
   useEffect(() => {
@@ -213,6 +308,124 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
     lastNotifCountRef.current = notifications.length;
   }, [notifications]);
 
+  const connectGmail = useCallback(async () => {
+    const result = await connectGmailWithGoogle();
+    setGmailAccessToken(result.accessToken);
+    setGmailEmail(result.user.email || null);
+
+    if (!user) {
+      try {
+        const res = await fetch('/api/auth/firebase-sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${result.idToken}`,
+          },
+          body: JSON.stringify({
+            name: result.user.displayName,
+            role: 'customer',
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setUser(data.user);
+          setProfile(data.profile);
+          setToken(data.token);
+        }
+      } catch {
+        // Non-blocking customer profile sync
+      }
+    }
+  }, [user]);
+
+  const disconnectGmail = useCallback(() => {
+    clearGmailAccessToken();
+    setGmailAccessToken(null);
+    setGmailEmail(null);
+  }, []);
+
+  const requestParcelOtp = useCallback(
+    async (parcelNumber: string) => {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (gmailAccessToken) {
+        headers.Authorization = `Bearer ${gmailAccessToken}`;
+      }
+      const res = await fetch('/api/parcels/request-otp', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ parcelNumber }),
+      });
+      const data = (await res.json()) as ParcelOtpChallenge & {
+        error?: string;
+        needsGmailAuth?: boolean;
+      };
+      if (!res.ok) {
+        if (data.needsGmailAuth) {
+          clearGmailAccessToken();
+          setGmailAccessToken(null);
+          setGmailEmail(null);
+        }
+        throw new Error(data.error || 'Invalid Parcel Number');
+      }
+      return data;
+    },
+    [gmailAccessToken]
+  );
+
+  const checkGmailInboxOtp = useCallback(
+    async (parcelNumber: string): Promise<string | null> => {
+      if (!gmailAccessToken) return null;
+      const res = await fetch(
+        `/api/parcels/gmail-otp-check?parcelNumber=${encodeURIComponent(parcelNumber)}`,
+        {
+          headers: { Authorization: `Bearer ${gmailAccessToken}` },
+        }
+      );
+      if (!res.ok) return null;
+      const data = (await res.json()) as { found?: boolean; otp?: string };
+      return data.found && data.otp ? data.otp : null;
+    },
+    [gmailAccessToken]
+  );
+
+  const verifyParcelOtp = useCallback(async (parcelNumber: string, otp: string) => {
+    const res = await fetch('/api/parcels/verify-otp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parcelNumber, otp }),
+    });
+    const data = (await res.json()) as {
+      verified?: boolean;
+      parcelToken?: string;
+      mission?: MissionWithDetails | null;
+      drone?: DroneRecord | null;
+      notifications?: NotificationRecord[];
+      error?: string;
+    };
+    if (!res.ok || !data.parcelToken) {
+      throw new Error(data.error || 'OTP verification failed');
+    }
+    setParcelToken(data.parcelToken);
+    setMissions(data.mission ? [data.mission] : []);
+    setDrones(data.drone ? [data.drone] : []);
+    setNotifications(data.notifications || []);
+    lastNotifCountRef.current = (data.notifications || []).length;
+  }, []);
+
+  const clearVerifiedParcel = useCallback(() => {
+    setParcelToken(null);
+    if (user?.role !== 'operator') {
+      setMissions([]);
+      setDrones([]);
+      setNotifications([]);
+    }
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'unsubscribe' }));
+    }
+  }, [user?.role]);
+
   const openAuthModal = useCallback((role: UserRole = 'customer') => {
     setAuthModalRole(role);
     setAuthModalOpen(true);
@@ -225,6 +438,12 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
   const signInWithGoogle = useCallback(
     async (role: UserRole = 'customer', operatorPasscode?: string) => {
       const credential = await signInWithPopup(auth, googleAuthProvider);
+      const oauthCred = GoogleAuthProvider.credentialFromResult(credential);
+      if (oauthCred?.accessToken) {
+        cacheGmailAccessToken(oauthCred.accessToken);
+        setGmailAccessToken(oauthCred.accessToken);
+        setGmailEmail(credential.user.email || null);
+      }
       const idToken = await credential.user.getIdToken();
       const res = await fetch('/api/auth/firebase-sync', {
         method: 'POST',
@@ -285,16 +504,31 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
     } catch {
       // Ignore if signed in via OTP/Email session
     }
+    clearGmailAccessToken();
+    setGmailAccessToken(null);
+    setGmailEmail(null);
     setUser(null);
     setProfile(null);
     setToken(null);
+    setParcelToken(null);
+    setMissions([]);
+    setDrones([]);
+    setNotifications([]);
     setActivePortal('customer');
   }, []);
 
   const markAllNotificationsRead = useCallback(async () => {
-    await fetch('/api/notifications/read-all', { method: 'PATCH' });
+    const headers: Record<string, string> = {};
+    if (user?.role === 'operator' && token) {
+      headers.Authorization = `Bearer ${token}`;
+    } else if (parcelToken) {
+      headers['X-Parcel-Token'] = parcelToken;
+    } else {
+      return;
+    }
+    await fetch('/api/notifications/read-all', { method: 'PATCH', headers });
     setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
-  }, []);
+  }, [user?.role, token, parcelToken]);
 
   const setProfileState = useCallback(
     (nextUser: UserRecord, nextProfile: CustomerProfile) => {
@@ -318,6 +552,15 @@ export const AegisProvider: React.FC<{ children: React.ReactNode }> = ({
         user,
         profile,
         token,
+        gmailAccessToken,
+        gmailEmail,
+        connectGmail,
+        disconnectGmail,
+        parcelToken,
+        requestParcelOtp,
+        verifyParcelOtp,
+        checkGmailInboxOtp,
+        clearVerifiedParcel,
         mapsApiKey,
         missions,
         drones,
@@ -348,3 +591,4 @@ export function useAegis() {
   if (!ctx) throw new Error('useAegis must be used inside AegisProvider');
   return ctx;
 }
+

@@ -85,6 +85,7 @@ export async function seedInitialFleetAndMissions() {
   try {
     const existingDrones = await db.select().from(drones);
     if (existingDrones.length > 0) {
+      await ensureCustomerShowcaseParcels(existingDrones);
       return;
     }
 
@@ -216,6 +217,7 @@ export async function seedInitialFleetAndMissions() {
         customerId: demoCustomer.id,
         recipientName: 'Lakshmi Narayana',
         recipientPhone: '+91 98490 24511',
+        recipientEmail: 'lakshmi.devi@hyderabad.in',
         destinationAddress: 'KPHB Phase 3, Road No 4, Kukatpally, Hyderabad',
         destLat: 17.4948,
         destLng: 78.3996,
@@ -235,6 +237,7 @@ export async function seedInitialFleetAndMissions() {
         customerId: demoCustomer.id,
         recipientName: 'Ananya Sharma',
         recipientPhone: '+91 91008 77341',
+        recipientEmail: 'ananya.sharma@hyderabad.in',
         destinationAddress: 'Plot No 68, Flat 201, Gajularamaram, Hyderabad',
         destLat: 17.5264,
         destLng: 78.4189,
@@ -254,6 +257,7 @@ export async function seedInitialFleetAndMissions() {
         customerId: demoCustomer.id,
         recipientName: 'Lakshmi Narayana',
         recipientPhone: '+91 98490 24511',
+        recipientEmail: 'lakshmi.devi@hyderabad.in',
         destinationAddress: 'Plot No 68, Flat 201, Gajularamaram, Hyderabad',
         destLat: 17.5264,
         destLng: 78.4189,
@@ -274,6 +278,7 @@ export async function seedInitialFleetAndMissions() {
         customerId: demoCustomer.id,
         recipientName: 'Ramesh Rao',
         recipientPhone: '+91 99850 11204',
+        recipientEmail: 'ramesh.rao@hyderabad.in',
         destinationAddress: 'Pragathi Nagar Lake View, Bachupally, Hyderabad',
         destLat: 17.5158,
         destLng: 78.3742,
@@ -298,6 +303,7 @@ export async function seedInitialFleetAndMissions() {
           customerId: spec.customerId,
           recipientName: spec.recipientName,
           recipientPhone: spec.recipientPhone,
+          recipientEmail: spec.recipientEmail,
           pickupAddress: MOTHER_BASE.address,
           pickupLat: MOTHER_BASE.lat,
           pickupLng: MOTHER_BASE.lng,
@@ -413,9 +419,204 @@ export async function seedInitialFleetAndMissions() {
         isRead: true,
       },
     ]);
+    await ensureCustomerShowcaseParcels(seededDrones);
   } catch (error) {
     console.error('Failed to seed fleet & missions:', error);
     throw new Error('Failed to initialize operational seed data.', { cause: error });
+  }
+}
+
+export async function ensureCustomerShowcaseParcels(
+  availableDrones?: Array<typeof drones.$inferSelect>
+) {
+  const fleet = availableDrones?.length
+    ? availableDrones
+    : await db.select().from(drones).orderBy(drones.id);
+  if (fleet.length === 0) return;
+
+  const showcaseSpecs = [
+    {
+      parcelNumber: 'AEG-1020',
+      recipientName: 'Sundhangsu',
+      recipientPhone: '+91 63020 83394',
+      recipientEmail: 'sudhagsu.2006@gmail.com',
+      destinationAddress: 'KPHB Phase 3, Road No 4, Kukatpally, Hyderabad',
+      destLat: 17.4948,
+      destLng: 78.3996,
+      weightKg: 1.3,
+      priority: 'high',
+      currentStage: 'In Transit',
+      qrCode: 'AEGIS-VER-1020-HYD',
+      deliveryProofUrl: '',
+      deliveryProofNote: '',
+      drone: fleet[0],
+      missionCode: 'MSN-8820',
+      missionStatus: 'in_transit',
+      progressPct: 52,
+    },
+    {
+      parcelNumber: 'AEG-1045',
+      recipientName: 'Sai Likhit',
+      recipientPhone: '+91 93470 46606',
+      recipientEmail: 'sl.pulipaka@gmail.com',
+      destinationAddress: 'Plot No 68, Flat 201, Gajularamaram, Hyderabad',
+      destLat: 17.5264,
+      destLng: 78.4189,
+      weightKg: 1.1,
+      priority: 'emergency',
+      currentStage: 'Near Destination',
+      qrCode: 'AEGIS-VER-1045-HYD',
+      deliveryProofUrl: '',
+      deliveryProofNote: '',
+      drone: fleet[1] || fleet[0],
+      missionCode: 'MSN-8845',
+      missionStatus: 'near_destination',
+      progressPct: 82,
+    },
+    {
+      parcelNumber: 'AEG-1023',
+      recipientName: 'Abhinav',
+      recipientPhone: '+91 95055 22701',
+      recipientEmail: 'abhinav.aegis@gmail.com',
+      destinationAddress: 'Pragathi Nagar Lake View, Bachupally, Hyderabad',
+      destLat: 17.5158,
+      destLng: 78.3742,
+      weightKg: 1.6,
+      priority: 'medium',
+      currentStage: 'Delivered',
+      qrCode: 'AEGIS-VER-1023-HYD',
+      deliveryProofUrl: '/src/assets/images/delivery_proof_porch_1795193986831.jpg',
+      deliveryProofNote: 'Smart pod released safely at doorstep pad · Signed via OTP',
+      drone: fleet[2] || fleet[0],
+      missionCode: 'MSN-8823',
+      missionStatus: 'delivered',
+      progressPct: 100,
+    },
+  ];
+
+  for (const spec of showcaseSpecs) {
+    const existing = await db
+      .select()
+      .from(parcels)
+      .where(eq(parcels.parcelNumber, spec.parcelNumber));
+    if (existing.length > 0) {
+      // Keep registered recipient name, phone, and Gmail address synced
+      if (
+        existing[0].recipientName !== spec.recipientName ||
+        existing[0].recipientPhone !== spec.recipientPhone ||
+        existing[0].recipientEmail !== spec.recipientEmail
+      ) {
+        await db
+          .update(parcels)
+          .set({
+            recipientName: spec.recipientName,
+            recipientPhone: spec.recipientPhone,
+            recipientEmail: spec.recipientEmail,
+          })
+          .where(eq(parcels.id, existing[0].id));
+      }
+      continue;
+    }
+
+    const [insertedParcel] = await db
+      .insert(parcels)
+      .values({
+        parcelNumber: spec.parcelNumber,
+        recipientName: spec.recipientName,
+        recipientPhone: spec.recipientPhone,
+        recipientEmail: spec.recipientEmail,
+        pickupAddress: MOTHER_BASE.address,
+        pickupLat: MOTHER_BASE.lat,
+        pickupLng: MOTHER_BASE.lng,
+        destinationAddress: spec.destinationAddress,
+        destLat: spec.destLat,
+        destLng: spec.destLng,
+        weightKg: spec.weightKg,
+        priority: spec.priority,
+        currentStage: spec.currentStage,
+        qrCode: spec.qrCode,
+        deliveryProofUrl: spec.deliveryProofUrl,
+        deliveryProofNote: spec.deliveryProofNote,
+      })
+      .returning();
+
+    const stageIndex = DELIVERY_STAGES.indexOf(
+      spec.currentStage as (typeof DELIVERY_STAGES)[number]
+    );
+    for (let i = 0; i <= stageIndex; i++) {
+      await db.insert(deliveryStatuses).values({
+        parcelId: insertedParcel.id,
+        stage: DELIVERY_STAGES[i],
+        note:
+          i === 0
+            ? 'Parcel logged & scanned at Gajularamaram Hub'
+            : `Automated checkpoint verified (${DELIVERY_STAGES[i]})`,
+      });
+    }
+
+    const distKm = haversineKm(
+      MOTHER_BASE.lat,
+      MOTHER_BASE.lng,
+      spec.destLat,
+      spec.destLng
+    );
+    const assessment = calculateMissionAssessment({
+      distanceKm: distKm,
+      weightKg: spec.weightKg,
+      windSpeedKmh: 11.4,
+      visibilityKm: 10,
+      precipitationMm: 0,
+      droneBatteryPct: spec.drone.batteryPct,
+      droneHealthPct: spec.drone.healthPct,
+    });
+    const waypoints = buildMissionWaypoints(
+      MOTHER_BASE.lat,
+      MOTHER_BASE.lng,
+      spec.destLat,
+      spec.destLng
+    );
+    const etaDate = new Date(Date.now() + assessment.etaMinutes * 60000);
+
+    const [insertedMission] = await db
+      .insert(missions)
+      .values({
+        missionCode: spec.missionCode,
+        parcelId: insertedParcel.id,
+        droneId: spec.drone.id,
+        status: spec.missionStatus,
+        distanceKm: distKm,
+        estimatedBatteryPct: assessment.estimatedBatteryPct,
+        riskScore: assessment.riskScore,
+        successProbability: assessment.successProbability,
+        waypointsJson: JSON.stringify(waypoints),
+        progressPct: spec.progressPct,
+        departureTime: new Date(Date.now() - 8 * 60000),
+        eta: etaDate,
+        completedAt: spec.missionStatus === 'delivered' ? new Date() : null,
+      })
+      .returning();
+
+    await db.insert(missionLogs).values({
+      missionId: insertedMission.id,
+      droneCode: spec.drone.code,
+      eventType: 'MISSION_INITIALIZED',
+      message: `Assigned ${spec.drone.code} · Corridor ${distKm} km · Success ${assessment.successProbability}%`,
+      actor: 'ORACLE_SYSTEM',
+    });
+
+    await db.insert(notifications).values({
+      parcelNumber: spec.parcelNumber,
+      eventType:
+        spec.missionStatus === 'delivered' ? 'Parcel Delivered' : 'Drone Dispatched',
+      channel: 'sms',
+      title: `${spec.parcelNumber} Update for ${spec.recipientName}`,
+      message:
+        spec.missionStatus === 'delivered'
+          ? `Delivered safely at ${spec.destinationAddress}.`
+          : `${spec.drone.code} en route to ${spec.destinationAddress}.`,
+      recipientTarget: spec.recipientPhone,
+      isRead: spec.missionStatus === 'delivered',
+    });
   }
 }
 
@@ -453,6 +654,44 @@ export async function getAllMissionsWithDetails() {
   } catch (error) {
     console.error('Database query failed in getAllMissionsWithDetails:', error);
     throw new Error('Failed to load mission telemetry.', { cause: error });
+  }
+}
+
+export async function getSingleMissionWithDetailsByParcelId(parcelId: number) {
+  try {
+    const [parcel] = await db
+      .select()
+      .from(parcels)
+      .where(eq(parcels.id, parcelId));
+    if (!parcel) return null;
+
+    const [mission] = await db
+      .select()
+      .from(missions)
+      .where(eq(missions.parcelId, parcel.id))
+      .orderBy(desc(missions.createdAt));
+    if (!mission) return null;
+
+    const [drone] = await db
+      .select()
+      .from(drones)
+      .where(eq(drones.id, mission.droneId));
+
+    const statusHistory = await db
+      .select()
+      .from(deliveryStatuses)
+      .where(eq(deliveryStatuses.parcelId, parcel.id))
+      .orderBy(deliveryStatuses.recordedAt);
+
+    return {
+      ...mission,
+      parcel,
+      drone: drone || null,
+      statusHistory,
+    };
+  } catch (error) {
+    console.error('Database query failed in getSingleMissionWithDetailsByParcelId:', error);
+    throw new Error('Failed to fetch parcel mission details.', { cause: error });
   }
 }
 

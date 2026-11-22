@@ -66,6 +66,7 @@ export interface ParcelRecord {
   customerId: number | null;
   recipientName: string;
   recipientPhone: string;
+  recipientEmail: string;
   pickupAddress: string;
   pickupLat: number;
   pickupLng: number;
